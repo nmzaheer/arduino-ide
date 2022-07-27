@@ -2,8 +2,6 @@ import { inject, injectable } from '@theia/core/shared/inversify';
 import { Emitter } from '@theia/core/lib/common/event';
 import { ArduinoMenus } from '../menu/arduino-menus';
 import { ArduinoToolbar } from '../toolbar/arduino-toolbar';
-import { BoardsDataStore } from '../boards/boards-data-store';
-import { BoardsServiceProvider } from '../boards/boards-service-provider';
 import {
   CoreServiceContribution,
   Command,
@@ -14,23 +12,21 @@ import {
 } from './contribution';
 import { nls } from '@theia/core/lib/common';
 import { CurrentSketch } from '../../common/protocol/sketches-service-client-impl';
+import { CoreService } from '../../common/protocol';
+import { CoreErrorHandler } from './core-error-handler';
 
 @injectable()
 export class VerifySketch extends CoreServiceContribution {
-  @inject(BoardsDataStore)
-  protected readonly boardsDataStore: BoardsDataStore;
+  @inject(CoreErrorHandler)
+  private readonly coreErrorHandler: CoreErrorHandler;
 
-  @inject(BoardsServiceProvider)
-  protected readonly boardsServiceClientImpl: BoardsServiceProvider;
-
-  protected readonly onDidChangeEmitter = new Emitter<Readonly<void>>();
-  readonly onDidChange = this.onDidChangeEmitter.event;
-
-  protected verifyInProgress = false;
+  private readonly onDidChangeEmitter = new Emitter<void>();
+  private readonly onDidChange = this.onDidChangeEmitter.event;
+  private verifyInProgress = false;
 
   override registerCommands(registry: CommandRegistry): void {
     registry.registerCommand(VerifySketch.Commands.VERIFY_SKETCH, {
-      execute: () => this.verifySketch(),
+      execute: (exportBinaries?: boolean) => this.verifySketch(exportBinaries),
       isEnabled: () => !this.verifyInProgress,
     });
     registry.registerCommand(VerifySketch.Commands.EXPORT_BINARIES, {
@@ -84,60 +80,80 @@ export class VerifySketch extends CoreServiceContribution {
     });
   }
 
-  async verifySketch(exportBinaries?: boolean): Promise<void> {
-    // even with buttons disabled, better to double check if a verify is already in progress
+  protected override handleError(error: unknown): void {
+    this.coreErrorHandler.tryHandle(error);
+    super.handleError(error);
+  }
+
+  private async verifySketch(
+    exportBinaries?: boolean
+  ): Promise<CoreService.Options.Compile | undefined> {
     if (this.verifyInProgress) {
-      return;
+      return undefined;
+    }
+    const options = await this.options(exportBinaries);
+    if (!options) {
+      return undefined;
     }
 
-    // toggle the toolbar button and menu item state.
-    // verifyInProgress will be set to false whether the compilation fails or not
-    const sketch = await this.sketchServiceClient.currentSketch();
-    if (!CurrentSketch.isValid(sketch)) {
-      return;
-    }
     try {
       this.verifyInProgress = true;
       this.coreErrorHandler.reset();
       this.onDidChangeEmitter.fire();
-      const { boardsConfig } = this.boardsServiceClientImpl;
-      const [fqbn, sourceOverride] = await Promise.all([
-        this.boardsDataStore.appendConfigToFqbn(
-          boardsConfig.selectedBoard?.fqbn
+      await this.doWithProgress({
+        progressText: nls.localize(
+          'arduino/sketch/compile',
+          'Compiling sketch...'
         ),
-        this.sourceOverride(),
-      ]);
-      const board = {
-        ...boardsConfig.selectedBoard,
-        name: boardsConfig.selectedBoard?.name || '',
-        fqbn,
-      };
-      const verbose = this.preferences.get('arduino.compile.verbose');
-      const compilerWarnings = this.preferences.get('arduino.compile.warnings');
-      const optimizeForDebug =
-        await this.commandService.executeCommand<boolean>(
-          'arduino-is-optimize-for-debug'
-        );
-      this.outputChannelManager.getChannel('Arduino').clear();
-      await this.coreService.compile({
-        sketch,
-        board,
-        optimizeForDebug: Boolean(optimizeForDebug),
-        verbose,
-        exportBinaries,
-        sourceOverride,
-        compilerWarnings,
+        task: (progressId, coreService) =>
+          coreService.compile({
+            ...options,
+            progressId,
+          }),
       });
       this.messageService.info(
         nls.localize('arduino/sketch/doneCompiling', 'Done compiling.'),
         { timeout: 3000 }
       );
+      // Returns with the used options for the compilation
+      // so that follow-up tasks (such as upload) can reuse the compiled code.
+      // Note that the `fqbn` is already decorated with the board settings, if any.
+      return options;
     } catch (e) {
       this.handleError(e);
+      return undefined;
     } finally {
       this.verifyInProgress = false;
       this.onDidChangeEmitter.fire();
     }
+  }
+
+  private async options(
+    exportBinaries?: boolean
+  ): Promise<CoreService.Options.Compile | undefined> {
+    const sketch = await this.sketchServiceClient.currentSketch();
+    if (!CurrentSketch.isValid(sketch)) {
+      return undefined;
+    }
+    const { boardsConfig } = this.boardsServiceProvider;
+    const [fqbn, sourceOverride, optimizeForDebug] = await Promise.all([
+      this.boardsDataStore.appendConfigToFqbn(boardsConfig.selectedBoard?.fqbn),
+      this.sourceOverride(),
+      this.commandService.executeCommand<boolean>(
+        'arduino-is-optimize-for-debug'
+      ),
+    ]);
+    const verbose = this.preferences.get('arduino.compile.verbose');
+    const compilerWarnings = this.preferences.get('arduino.compile.warnings');
+    return {
+      sketch,
+      fqbn,
+      optimizeForDebug: Boolean(optimizeForDebug),
+      verbose,
+      exportBinaries,
+      sourceOverride,
+      compilerWarnings,
+    };
   }
 }
 
