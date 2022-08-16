@@ -1,5 +1,12 @@
 import { injectable, inject } from '@theia/core/shared/inversify';
-import * as fs from 'fs';
+import {
+  promises as fs,
+  realpath,
+  realpathSync,
+  lstat,
+  Stats,
+  constants,
+} from 'fs';
 import * as os from 'os';
 import * as temp from 'temp';
 import * as tempDir from 'temp-dir';
@@ -26,7 +33,6 @@ import {
   ArchiveSketchRequest,
   LoadSketchRequest,
 } from './cli-protocol/cc/arduino/cli/commands/v1/commands_pb';
-import { duration } from '../common/decorators';
 import * as glob from 'glob';
 import { Deferred } from '@theia/core/lib/common/promise-util';
 import { ServiceError } from './service-error';
@@ -42,45 +48,25 @@ export class SketchesServiceImpl
 {
   private sketchSuffixIndex = 1;
   private lastSketchBaseName: string;
+  private recentSketches: SketchWithDetails[] | undefined;
   // If on macOS, the `temp-dir` lib will make sure there is resolved realpath.
   // If on Windows, the `C:\Users\KITTAA~1\AppData\Local\Temp` path will be resolved and normalized to `C:\Users\kittaakos\AppData\Local\Temp`.
   // Note: VS Code URI normalizes the drive letter. `C:` will be converted into `c:`.
   // https://github.com/Microsoft/vscode/issues/68325#issuecomment-462239992
-  private tempDirRealpath = isOSX
+  private readonly tempDirRealpath = isOSX
     ? tempDir
-    : maybeNormalizeDrive(fs.realpathSync.native(tempDir));
+    : maybeNormalizeDrive(realpathSync.native(tempDir));
 
   @inject(ConfigServiceImpl)
-  protected readonly configService: ConfigServiceImpl;
+  private readonly configService: ConfigServiceImpl;
 
   @inject(NotificationServiceServerImpl)
-  protected readonly notificationService: NotificationServiceServerImpl;
+  private readonly notificationService: NotificationServiceServerImpl;
 
   @inject(EnvVariablesServer)
-  protected readonly envVariableServer: EnvVariablesServer;
+  private readonly envVariableServer: EnvVariablesServer;
 
-  async getSketches({
-    uri,
-    exclude,
-  }: {
-    uri?: string;
-    exclude?: string[];
-  }): Promise<SketchContainer> {
-    const [/*old,*/ _new] = await Promise.all([
-      // this.getSketchesOld({ uri, exclude }),
-      this.getSketchesNew({ uri, exclude }),
-    ]);
-    return _new;
-  }
-
-  @duration()
-  async getSketchesNew({
-    uri,
-    exclude,
-  }: {
-    uri?: string;
-    exclude?: string[];
-  }): Promise<SketchContainer> {
+  async getSketches({ uri }: { uri?: string }): Promise<SketchContainer> {
     const root = await this.root(uri);
     const pathToAllSketchFiles = await new Promise<string[]>(
       (resolve, reject) => {
@@ -174,7 +160,7 @@ export class SketchesServiceImpl
       if (child) {
         child.sketches.push({
           name: sketchName,
-          uri: FileUri.create(pathToSketchFile).toString(),
+          uri: FileUri.create(path.dirname(pathToSketchFile)).toString(),
         });
       }
     }
@@ -196,8 +182,8 @@ export class SketchesServiceImpl
     const requestSketchPath = FileUri.fsPath(uri);
     req.setSketchPath(requestSketchPath);
     req.setInstance(instance);
-    const stat = new Deferred<fs.Stats | Error>();
-    fs.lstat(requestSketchPath, (err, result) =>
+    const stat = new Deferred<Stats | Error>();
+    lstat(requestSketchPath, (err, result) =>
       err ? stat.resolve(err) : stat.resolve(result)
     );
     const sketch = await new Promise<SketchWithDetails>((resolve, reject) => {
@@ -262,17 +248,27 @@ export class SketchesServiceImpl
       .then((uri) => path.join(FileUri.fsPath(uri), 'recent-sketches.json'));
   }
 
-  private async loadRecentSketches(
-    fsPath: string
-  ): Promise<Record<string, number>> {
+  private async loadRecentSketches(): Promise<Record<string, number>> {
+    const fsPath = await this.recentSketchesFsPath;
     let data: Record<string, number> = {};
+    const raw = await fs.readFile(fsPath, {
+      encoding: 'utf8',
+    });
     try {
-      const raw = await promisify(fs.readFile)(fsPath, {
-        encoding: 'utf8',
-      });
       data = JSON.parse(raw);
-    } catch {}
+    } catch (err) {
+      console.error(
+        `Could not parse recently opened sketches. Raw input was: ${raw}`
+      );
+    }
     return data;
+  }
+
+  private async saveRecentSketches(
+    data: Record<string, number>
+  ): Promise<void> {
+    const fsPath = await this.recentSketchesFsPath;
+    await fs.writeFile(fsPath, JSON.stringify(data, null, 2));
   }
 
   async markAsRecentlyOpened(uri: string): Promise<void> {
@@ -286,8 +282,7 @@ export class SketchesServiceImpl
       return;
     }
 
-    const fsPath = await this.recentSketchesFsPath;
-    const data = await this.loadRecentSketches(fsPath);
+    const data = await this.loadRecentSketches();
     const now = Date.now();
     data[sketch.uri] = now;
 
@@ -306,42 +301,48 @@ export class SketchesServiceImpl
       delete data[toDeleteUri];
     }
 
-    await promisify(fs.writeFile)(fsPath, JSON.stringify(data, null, 2));
-    this.recentlyOpenedSketches().then((sketches) =>
+    await this.saveRecentSketches(data);
+    this.recentlyOpenedSketches(true).then((sketches) =>
       this.notificationService.notifyRecentSketchesDidChange({ sketches })
     );
   }
 
-  async recentlyOpenedSketches(): Promise<Sketch[]> {
-    const configDirUri = await this.envVariableServer.getConfigDirUri();
-    const fsPath = path.join(
-      FileUri.fsPath(configDirUri),
-      'recent-sketches.json'
-    );
-    let data: Record<string, number> = {};
-    try {
-      const raw = await promisify(fs.readFile)(fsPath, {
-        encoding: 'utf8',
-      });
-      data = JSON.parse(raw);
-    } catch {}
-
-    const sketches: SketchWithDetails[] = [];
-    for (const uri of Object.keys(data).sort(
-      (left, right) => data[right] - data[left]
-    )) {
-      try {
-        const sketch = await this.loadSketch(uri);
-        sketches.push(sketch);
-      } catch {}
+  async recentlyOpenedSketches(forceUpdate?: boolean): Promise<Sketch[]> {
+    if (!this.recentSketches || forceUpdate) {
+      const data = await this.loadRecentSketches();
+      const sketches: SketchWithDetails[] = [];
+      let needsUpdate = false;
+      for (const uri of Object.keys(data).sort(
+        (left, right) => data[right] - data[left]
+      )) {
+        let sketch: SketchWithDetails | undefined = undefined;
+        try {
+          sketch = await this.loadSketch(uri);
+        } catch {}
+        if (!sketch) {
+          needsUpdate = true;
+        } else {
+          sketches.push(sketch);
+        }
+      }
+      if (needsUpdate) {
+        const data = sketches.reduce((acc, curr) => {
+          acc[curr.uri] = curr.mtimeMs;
+          return acc;
+        }, {} as Record<string, number>);
+        await this.saveRecentSketches(data);
+        this.notificationService.notifyRecentSketchesDidChange({ sketches });
+      }
+      this.recentSketches = sketches;
     }
-
-    return sketches;
+    return this.recentSketches;
   }
 
   async cloneExample(uri: string): Promise<Sketch> {
-    const sketch = await this.loadSketch(uri);
-    const parentPath = await this.createTempFolder();
+    const [sketch, parentPath] = await Promise.all([
+      this.loadSketch(uri),
+      this.createTempFolder(),
+    ]);
     const destinationUri = FileUri.create(
       path.join(parentPath, sketch.name)
     ).toString();
@@ -382,7 +383,7 @@ export class SketchesServiceImpl
         this.sketchSuffixIndex++
       )}`;
       // Note: we check the future destination folder (`directories.user`) for name collision and not the temp folder!
-      const sketchExists = await promisify(fs.exists)(
+      const sketchExists = await this.exists(
         path.join(sketchbookPath, sketchNameCandidate)
       );
       if (!sketchExists) {
@@ -429,7 +430,7 @@ void loop() {
           reject(createError);
           return;
         }
-        fs.realpath.native(dirPath, (resolveError, resolvedDirPath) => {
+        realpath.native(dirPath, (resolveError, resolvedDirPath) => {
           if (resolveError) {
             reject(resolveError);
             return;
@@ -496,7 +497,7 @@ void loop() {
     { destinationUri }: { destinationUri: string }
   ): Promise<string> {
     const source = FileUri.fsPath(sketch.uri);
-    const exists = await promisify(fs.exists)(source);
+    const exists = await this.exists(source);
     if (!exists) {
       throw new Error(`Sketch does not exist: ${sketch}`);
     }
@@ -538,7 +539,7 @@ void loop() {
     const destination = FileUri.fsPath(destinationUri);
     let tempDestination = await this.createTempFolder();
     tempDestination = path.join(tempDestination, sketch.name);
-    await fs.promises.mkdir(tempDestination, { recursive: true });
+    await fs.mkdir(tempDestination, { recursive: true });
     await copy(source, tempDestination);
     await copy(tempDestination, destination);
     return FileUri.create(destination).toString();
@@ -549,8 +550,8 @@ void loop() {
     const { client } = await this.coreClient;
     const archivePath = FileUri.fsPath(destinationUri);
     // The CLI cannot override existing archives, so we have to wipe it manually: https://github.com/arduino/arduino-cli/issues/1160
-    if (await promisify(fs.exists)(archivePath)) {
-      await promisify(fs.unlink)(archivePath);
+    if (await this.exists(archivePath)) {
+      await fs.unlink(archivePath);
     }
     const req = new ArchiveSketchRequest();
     req.setSketchPath(FileUri.fsPath(sketch.uri));
@@ -574,9 +575,18 @@ void loop() {
 
   async getIdeTempFolderPath(sketch: Sketch): Promise<string> {
     const sketchPath = FileUri.fsPath(sketch.uri);
-    await fs.promises.readdir(sketchPath); // Validates the sketch folder and rejects if not accessible.
+    await fs.readdir(sketchPath); // Validates the sketch folder and rejects if not accessible.
     const suffix = crypto.createHash('md5').update(sketchPath).digest('hex');
     return path.join(os.tmpdir(), `arduino-ide2-${suffix}`);
+  }
+
+  private async exists(pathLike: string): Promise<boolean> {
+    try {
+      await fs.access(pathLike, constants.R_OK | constants.W_OK);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
