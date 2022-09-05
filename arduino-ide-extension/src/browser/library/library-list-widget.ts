@@ -201,7 +201,10 @@ class MessageBoxDialog extends AbstractDialog<MessageBoxDialog.Result> {
       options.buttons || [nls.localize('vscode/issueMainService/ok', 'OK')]
     ).forEach((text, index) => {
       const button = this.createButton(text);
-      button.classList.add(index === 0 ? 'main' : 'secondary');
+      button.classList.add(
+        index === 0 ? 'main' : 'secondary',
+        'message-box-dialog-button'
+      );
       this.controlPanel.appendChild(button);
       this.toDisposeOnDetach.push(
         addEventListener(button, 'click', () => {
