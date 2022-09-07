@@ -23,8 +23,10 @@ import * as os from '@theia/core/lib/common/os';
 import { Restart } from '@theia/core/lib/electron-common/messaging/electron-messages';
 import { TheiaBrowserWindowOptions } from '@theia/core/lib/electron-main/theia-electron-window';
 import { IsTempSketch } from '../../node/is-temp-sketch';
+import { CLOSE_PLOTTER_WINDOW, SHOW_PLOTTER_WINDOW } from '../../common/ipc-communication';
 
 app.commandLine.appendSwitch('disable-http-cache');
+app.commandLine.appendSwitch('disable-site-isolation-trials');
 
 interface WorkspaceOptions {
   file: string;
@@ -325,12 +327,20 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
               devTools: true,
               nativeWindowOpen: true,
               openerId: electronWindow?.webContents.id,
+              webSecurity: false,
+              nodeIntegration: false,
             },
           });
           event.newGuest = new BrowserWindow(options);
+
+          const showPlotterWindow = () => {
+            event.newGuest?.show();
+          };
+          ipcMain.on(SHOW_PLOTTER_WINDOW, showPlotterWindow);
           event.newGuest.setMenu(null);
           event.newGuest?.on('closed', () => {
-            electronWindow?.webContents.send('CLOSE_CHILD_WINDOW');
+            ipcMain.removeListener(SHOW_PLOTTER_WINDOW, showPlotterWindow);
+            electronWindow?.webContents.send(CLOSE_PLOTTER_WINDOW);
           });
           event.newGuest?.loadURL(url);
         }
